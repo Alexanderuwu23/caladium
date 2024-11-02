@@ -1,0 +1,213 @@
+local lz4 = {}
+
+type Streamer = {
+    Offset: number,
+    Source: string,
+    Length: number,
+    IsFinished: boolean,
+    LastUnreadBytes: number,
+
+    read: (Streamer, len: number?, shiftOffset: boolean?) -> string,
+    seek: (Streamer, len: number) -> (),
+    append: (Streamer, newData: string) -> (),
+    toEnd: (Streamer) -> ()
+}
+
+local function streamer(str): Streamer
+    local Stream = {}
+    Stream.Offset = 0
+    Stream.Source = str
+    Stream.Length = string.len(str)
+    Stream.IsFinished = false   
+    Stream.LastUnreadBytes = 0
+
+    function Stream.read(self: Streamer, len: number?, shift: boolean?): string
+        local len = len or 1
+        local shift = if shift ~= nil then shift else true
+        local dat = string.sub(self.Source, self.Offset + 1, self.Offset + len)
+
+        local dataLength = string.len(dat)
+        local unreadBytes = len - dataLength
+
+        if shift then
+            self:seek(len)
+        end
+
+        self.LastUnreadBytes = unreadBytes
+        return dat
+    end
+
+    function Stream.seek(self: Streamer, len: number)
+        local len = len or 1
+
+        self.Offset = math.clamp(self.Offset + len, 0, self.Length)
+        self.IsFinished = self.Offset >= self.Length
+    end
+
+    function Stream.append(self: Streamer, newData: string)
+        -- adds new data to the end of a stream
+        self.Source ..= newData
+        self.Length = string.len(self.Source)
+        self:seek(0) --hacky but forces a recalculation of the isFinished flag
+    end
+
+    function Stream.toEnd(self: Streamer)
+        self:seek(self.Length)
+    end
+
+    return Stream
+end
+
+function lz4.compress(str: string): string
+    local blocks = {}
+    local iostream = streamer(str)
+    local processed = ""
+    local LiteralPushValue = ""
+    local pushToLiteral = true
+
+    while not iostream.IsFinished do
+        pushToLiteral = true
+        local nextByte = iostream:read()
+
+        if string.find(processed, nextByte, 1, true) then
+            local match = nextByte .. iostream:read(3, false)
+
+            if #match < 4 then
+                LiteralPushValue = match
+                iostream:seek(3)
+            else
+                local matchPos = string.find(processed, match, 1, true)
+
+                if matchPos then
+                    iostream:seek(3)
+
+                    while string.find(processed, match .. iostream:read(1, false), 1, true) do
+                        match = match .. iostream:read(1, false)
+                        matchPos = string.find(processed, match, 1, true)
+                    end
+
+                    local matchLen = #match
+                    local realPosition = #processed - matchPos + 1
+                    processed = processed .. match
+
+                    table.insert(blocks, {
+                        Literal = "",
+                        LiteralLength = 0,
+                        MatchOffset = realPosition,
+                        MatchLength = matchLen,
+                    })
+                    pushToLiteral = false
+                end
+            end
+        end
+
+        if pushToLiteral then
+            LiteralPushValue = nextByte
+            table.insert(blocks, {
+                Literal = LiteralPushValue,
+                LiteralLength = #LiteralPushValue,
+                MatchOffset = nil,
+                MatchLength = nil,
+            })
+            processed = processed .. nextByte
+        end
+    end
+
+    local output = string.rep("\x00", 4)
+    local function write(char)
+        output = output .. char
+    end
+
+    for _, chunk in ipairs(blocks) do
+        local tokenLit = math.clamp(chunk.LiteralLength, 0, 15)
+        local tokenMat = chunk.MatchLength and math.clamp(chunk.MatchLength - 4, 0, 15) or 0
+
+        local token = bit32.lshift(tokenLit, 4) + tokenMat
+        write(string.pack("<I1", token))
+
+        if chunk.LiteralLength >= 15 then
+            local litLen = chunk.LiteralLength - 15
+            repeat
+                local nextToken = math.clamp(litLen, 0, 0xFF)
+                write(string.pack("<I1", nextToken))
+                litLen = litLen - 255
+            until litLen < 0xFF
+        end
+
+        write(chunk.Literal)
+
+        if chunk.MatchOffset then
+            write(string.pack("<I2", chunk.MatchOffset))
+
+            if chunk.MatchLength and chunk.MatchLength - 4 >= 15 then
+                local matLen = chunk.MatchLength - 4 - 15
+                repeat
+                    local nextToken = math.clamp(matLen, 0, 0xFF)
+                    write(string.pack("<I1", nextToken))
+                    matLen = matLen - 255
+                until matLen < 0xFF
+            end
+        end
+    end
+
+    local compLen = #output - 4
+    local decompLen = iostream.Length
+
+    return string.pack("<I4", compLen) .. string.pack("<I4", decompLen) .. output
+end
+
+function lz4.decompress(lz4data: string): string
+    local inputStream = streamer(lz4data)
+
+    local compressedLen = string.unpack("<I4", inputStream:read(4))
+    local decompressedLen = string.unpack("<I4", inputStream:read(4))
+    inputStream:read(4) 
+
+    if compressedLen == 0 then
+        return inputStream:read(decompressedLen)
+    end
+
+    local outputStream = streamer("")
+
+    while not inputStream.IsFinished do
+        local token = string.byte(inputStream:read())
+        local litLen = bit32.rshift(token, 4)
+        local matLen = bit32.band(token, 15) + 4
+
+        if litLen >= 15 then
+            repeat
+                local nextByte = string.byte(inputStream:read())
+                litLen = litLen + nextByte
+            until nextByte ~= 0xFF
+        end
+
+        local literal = inputStream:read(litLen)
+        outputStream:append(literal)
+        outputStream:toEnd()
+
+        if outputStream.Length < decompressedLen then
+            local offset = string.unpack("<I2", inputStream:read(2))
+            if matLen >= 19 then
+                repeat
+                    local nextByte = string.byte(inputStream:read())
+                    matLen = matLen + nextByte
+                until nextByte ~= 0xFF
+            end
+
+            outputStream:seek(-offset)
+            local match = outputStream:read(matLen)
+
+            while outputStream.LastUnreadBytes > 0 do
+                outputStream:seek(-offset)
+                match = match .. outputStream:read(outputStream.LastUnreadBytes)
+            end
+
+            outputStream:append(match)
+            outputStream:toEnd()
+        end
+    end
+
+    return outputStream.Source
+end
+
+return lz4
