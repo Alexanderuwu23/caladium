@@ -6,11 +6,13 @@ type Streamer = {
     Length: number,
     IsFinished: boolean,
     LastUnreadBytes: number,
+    ProcessedChunks: table, -- Nuevo campo para almacenar los chunks procesados
 
     read: (Streamer, len: number?, shiftOffset: boolean?) -> string,
     seek: (Streamer, len: number) -> (),
     append: (Streamer, newData: string) -> (),
-    toEnd: (Streamer) -> ()
+    toEnd: (Streamer) -> (),
+    logProcessedChunk: (Streamer, chunk: table) -> () -- Nueva función para registrar los chunks procesados
 }
 
 local function streamer(str): Streamer
@@ -20,6 +22,7 @@ local function streamer(str): Streamer
     Stream.Length = string.len(str)
     Stream.IsFinished = false   
     Stream.LastUnreadBytes = 0
+    Stream.ProcessedChunks = {} -- Inicialización de la tabla para almacenar los chunks procesados
 
     function Stream.read(self: Streamer, len: number?, shift: boolean?): string
         local len = len or 1
@@ -39,20 +42,22 @@ local function streamer(str): Streamer
 
     function Stream.seek(self: Streamer, len: number)
         local len = len or 1
-
         self.Offset = math.clamp(self.Offset + len, 0, self.Length)
         self.IsFinished = self.Offset >= self.Length
     end
 
     function Stream.append(self: Streamer, newData: string)
-        -- adds new data to the end of a stream
         self.Source ..= newData
         self.Length = string.len(self.Source)
-        self:seek(0) --hacky but forces a recalculation of the isFinished flag
+        self:seek(0)
     end
 
     function Stream.toEnd(self: Streamer)
         self:seek(self.Length)
+    end
+
+    function Stream.logProcessedChunk(self: Streamer, chunk: table)
+        table.insert(self.ProcessedChunks, chunk)
     end
 
     return Stream
@@ -90,12 +95,14 @@ function lz4.compress(str: string): string
                     local realPosition = #processed - matchPos + 1
                     processed = processed .. match
 
-                    table.insert(blocks, {
+                    local chunk = {
                         Literal = "",
                         LiteralLength = 0,
                         MatchOffset = realPosition,
                         MatchLength = matchLen,
-                    })
+                    }
+                    table.insert(blocks, chunk)
+                    iostream:logProcessedChunk(chunk)
                     pushToLiteral = false
                 end
             end
@@ -103,12 +110,14 @@ function lz4.compress(str: string): string
 
         if pushToLiteral then
             LiteralPushValue = nextByte
-            table.insert(blocks, {
+            local chunk = {
                 Literal = LiteralPushValue,
                 LiteralLength = #LiteralPushValue,
                 MatchOffset = nil,
                 MatchLength = nil,
-            })
+            }
+            table.insert(blocks, chunk)
+            iostream:logProcessedChunk(chunk)
             processed = processed .. nextByte
         end
     end
